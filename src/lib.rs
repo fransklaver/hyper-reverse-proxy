@@ -3,11 +3,14 @@
 #[macro_use]
 extern crate tracing;
 
+use hyper::body::{Body, Buf, Incoming};
 use hyper::header::{HeaderMap, HeaderName, HeaderValue, HOST};
 use hyper::http::header::{InvalidHeaderValue, ToStrError};
 use hyper::http::uri::InvalidUri;
 use hyper::upgrade::OnUpgrade;
-use hyper::{Body, Client, Error, Request, Response, StatusCode};
+use hyper::{Error, Request, Response, StatusCode};
+use hyper_util::client::legacy::{connect::Connect, Client};
+use hyper_util::rt::TokioIo;
 use lazy_static::lazy_static;
 use std::net::IpAddr;
 use thiserror::Error as ThisError;
@@ -59,6 +62,12 @@ impl From<InvalidHeaderValue> for ProxyError {
     }
 }
 
+impl From<hyper_util::client::legacy::Error> for ProxyError {
+    fn from(err: hyper_util::client::legacy::Error) -> Self {
+        ProxyError::UpgradeError(err.to_string())
+    }
+}
+
 fn remove_hop_headers(headers: &mut HeaderMap) {
     debug!("Removing hop headers");
 
@@ -68,7 +77,7 @@ fn remove_hop_headers(headers: &mut HeaderMap) {
 }
 
 fn get_upgrade_type(headers: &HeaderMap) -> Option<String> {
-    #[allow(clippy::blocks_in_if_conditions)]
+    #[allow(clippy::blocks_in_conditions)]
     if headers
         .get(&*CONNECTION_HEADER)
         .map(|value| {
@@ -271,12 +280,18 @@ fn create_proxied_request<B>(
     Ok(request)
 }
 
-pub async fn call<'a, T: hyper::client::connect::Connect + Clone + Send + Sync + 'static>(
+pub async fn call<T, I>(
     client_ip: IpAddr,
     forward_uri: &str,
-    mut request: Request<Body>,
-    client: &'a Client<T>,
-) -> Result<Response<Body>, ProxyError> {
+    mut request: Request<I>,
+    client: &Client<T, I>,
+) -> Result<Response<Incoming>, ProxyError>
+where
+    T: Connect + Unpin + Clone + Send + Sync + 'static,
+    I: Body + Send + Sync + Unpin + 'static,
+    <I as Body>::Data: Buf + Send + 'static,
+    <I as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+{
     info!(
         "Received proxy call from {} to {}, client: {}",
         request.uri().to_string(),
@@ -319,20 +334,22 @@ pub async fn call<'a, T: hyper::client::connect::Connect + Clone + Send + Sync +
 
         if request_upgrade_type == response_upgrade_type {
             if let Some(request_upgraded) = request_upgraded {
-                let mut response_upgraded = response
-                    .extensions_mut()
-                    .remove::<OnUpgrade>()
-                    .expect("response does not have an upgrade extension")
-                    .await?;
+                let mut response_upgraded = TokioIo::new(
+                    response
+                        .extensions_mut()
+                        .remove::<OnUpgrade>()
+                        .expect("response does not have an upgrade extension")
+                        .await?,
+                );
 
                 debug!("Responding to a connection upgrade response");
 
                 tokio::spawn(async move {
                     let mut request_upgraded =
-                        request_upgraded.await.expect("failed to upgrade request");
+                        TokioIo::new(request_upgraded.await.expect("failed to upgrade request"));
 
                     match copy_bidirectional(&mut response_upgraded, &mut request_upgraded).await {
-                        Ok(_) => debug!("successfull copy between upgraded connections"),
+                        Ok(_) => debug!("successful copy between upgraded connections"),
                         Err(_) => error!("failed copy between upgraded connections (EOF)"),
                     }
                 });
@@ -357,12 +374,21 @@ pub async fn call<'a, T: hyper::client::connect::Connect + Clone + Send + Sync +
     }
 }
 
-pub struct ReverseProxy<T: hyper::client::connect::Connect + Clone + Send + Sync + 'static> {
-    client: Client<T>,
+pub struct ReverseProxy<T, I>
+where
+    T: Connect + Clone + Send + Sync + 'static,
+{
+    client: Client<T, I>,
 }
 
-impl<T: hyper::client::connect::Connect + Clone + Send + Sync + 'static> ReverseProxy<T> {
-    pub fn new(client: Client<T>) -> Self {
+impl<T, I> ReverseProxy<T, I>
+where
+    T: Connect + Unpin + Clone + Send + Sync + 'static,
+    I: Body + Send + Sync + Unpin + 'static,
+    <I as Body>::Data: Send + Sync + 'static,
+    <I as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+{
+    pub fn new(client: Client<T, I>) -> Self {
         Self { client }
     }
 
@@ -370,9 +396,9 @@ impl<T: hyper::client::connect::Connect + Clone + Send + Sync + 'static> Reverse
         &self,
         client_ip: IpAddr,
         forward_uri: &str,
-        request: Request<Body>,
-    ) -> Result<Response<Body>, ProxyError> {
-        call::<T>(client_ip, forward_uri, request, &self.client).await
+        request: Request<I>,
+    ) -> Result<Response<Incoming>, ProxyError> {
+        call::<T, I>(client_ip, forward_uri, request, &self.client).await
     }
 }
 

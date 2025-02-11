@@ -1,11 +1,12 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use hyper::client::connect::dns::GaiResolver;
-use hyper::client::HttpConnector;
+use http_body_util::combinators::BoxBody;
 use hyper::header::HeaderName;
 use hyper::Uri;
-use hyper::{HeaderMap, Request, Response};
+use hyper::{body::Bytes, HeaderMap, Request, Response};
 use hyper_reverse_proxy::benches as internal_benches;
 use hyper_reverse_proxy::ReverseProxy;
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::rt::TokioExecutor;
 use rand::distributions::Alphanumeric;
 use rand::prelude::*;
 use std::net::Ipv4Addr;
@@ -15,11 +16,10 @@ use tokio::runtime::Runtime;
 use tokiotest_httpserver::HttpTestContext;
 
 lazy_static::lazy_static! {
-    static ref  PROXY_CLIENT: ReverseProxy<HttpConnector<GaiResolver>> = {
+    static ref  PROXY_CLIENT: ReverseProxy<HttpConnector, BoxBody<Bytes, hyper::Error>> =
         ReverseProxy::new(
-            hyper::Client::new(),
-        )
-    };
+            Client::builder(TokioExecutor::new()).build(HttpConnector::new())
+        );
 }
 
 fn create_proxied_response(b: &mut Criterion) {
@@ -71,7 +71,7 @@ fn proxy_call(b: &mut Criterion) {
 
     let uri = Uri::from_static("http://0.0.0.0:8080/me?hello=world");
 
-    let http_context: HttpTestContext = rt.block_on(async { AsyncTestContext::setup().await });
+    let http_context: HttpTestContext = rt.block_on(async { HttpTestContext::setup().await });
 
     let forward_url = &format!("http://0.0.0.0:{}", http_context.port);
 
@@ -90,7 +90,7 @@ fn proxy_call(b: &mut Criterion) {
                     .call(
                         black_box(client_ip),
                         black_box(forward_url),
-                        black_box(request.body(hyper::Body::from("")).unwrap()),
+                        black_box(request.body(BoxBody::default()).unwrap()),
                     )
                     .await
                     .unwrap();
